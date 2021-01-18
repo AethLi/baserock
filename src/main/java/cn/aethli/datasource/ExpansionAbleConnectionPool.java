@@ -1,11 +1,15 @@
 package cn.aethli.datasource;
 
+import cn.aethli.exception.DataRuntimeException;
+import org.apache.logging.log4j.LogManager;
+
 import javax.sql.DataSource;
 import java.io.PrintWriter;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
+import java.util.Iterator;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.logging.Logger;
@@ -17,130 +21,172 @@ import java.util.logging.Logger;
  */
 public class ExpansionAbleConnectionPool implements DataSource {
 
-  private static final ConcurrentLinkedDeque<Connection> POOL = new ConcurrentLinkedDeque<>();
-  private static ExpansionAbleConnectionPool connectionPool = null;
-  private static boolean initFlag = false;
-  private static String version;
+    private static final org.apache.logging.log4j.Logger LOGGER = LogManager.getLogger();
+    private static final int DEFAULT_TIMEOUT = 30;
+    private static final ConcurrentLinkedDeque<Connection> POOL = new ConcurrentLinkedDeque<>();
+    private static ExpansionAbleConnectionPool connectionPool = null;
+    private static boolean initFlag = false;
+    private static String version;
+    private static String url;
+    private static String user;
+    private static String password;
+    private PrintWriter logWriter;
+    private volatile int timeout = DEFAULT_TIMEOUT;
 
-  private static String url;
-  private static String user;
-  private static String password;
-
-  /** hidden construct method */
-  private ExpansionAbleConnectionPool() {}
-
-  /**
-   * singleton instance
-   *
-   * @return singleton instance
-   */
-  public static synchronized ExpansionAbleConnectionPool getInstance() {
-    if (!initFlag) {
-      throw new RuntimeException("can not invoke getInstance before init");
+    /**
+     * hidden construct method
+     */
+    private ExpansionAbleConnectionPool() {
     }
-    if (connectionPool == null) {
-      connectionPool = new ExpansionAbleConnectionPool();
+
+    /**
+     * singleton instance
+     *
+     * @return singleton instance
+     */
+    public static synchronized ExpansionAbleConnectionPool getInstance() {
+        if (!initFlag) {
+            throw new DataRuntimeException("can not invoke getInstance before init");
+        }
+        if (connectionPool == null) {
+            connectionPool = new ExpansionAbleConnectionPool();
+        }
+        return connectionPool;
     }
-    return connectionPool;
-  }
 
-  public static void print() {
-    System.out.println("connection pool size:\t" + POOL.size());
-  }
+    /**
+     * init database connection pool
+     *
+     * @param driver   database driver full name
+     * @param url      database url within a schema name
+     * @param user     database user
+     * @param password password
+     */
+    public static void init(String driver, String url, String user, String password, int poolSize)
+            throws SQLException {
 
-  /**
-   * init database connection pool
-   *
-   * @param driver database driver full name
-   * @param url database url within a schema name
-   * @param user database user
-   * @param password password
-   */
-  public static void init(String driver, String url, String user, String password, int poolSize)
-      throws SQLException, ClassNotFoundException {
+        LOGGER.info("Connection pool start init!");
 
-    ExpansionAbleConnectionPool.url = url;
-    ExpansionAbleConnectionPool.user = user;
-    ExpansionAbleConnectionPool.password = password;
+        ExpansionAbleConnectionPool.url = url;
+        ExpansionAbleConnectionPool.user = user;
+        ExpansionAbleConnectionPool.password = password;
 
-    // init driver
-    Class.forName(driver);
-    for (int i = 0; i < poolSize; i++) {
-      Connection conn = DriverManager.getConnection(url, user, password);
-      POOL.add(conn);
-    }
-    initFlag = true;
-    version = UUID.randomUUID().toString();
-  }
-
-  /**
-   * get connection from pool
-   *
-   * @return a database connection
-   */
-  public Connection getConnection() throws SQLException {
-    if (POOL.size() > 0) {
-      String v = version;
-      final Connection connection = POOL.removeFirst();
-      return (Connection)
-          Proxy.newProxyInstance(
-              ExpansionAbleConnectionPool.class.getClassLoader(),
-              connection.getClass().getInterfaces(),
-              (proxy, method, args) -> {
-                if (!"close".equals(method.getName())) {
-                  return method.invoke(connection, args);
-                } else {
-                  addConnection(connection, v);
-                  return null;
+        if (initFlag) {
+            synchronized (POOL) {
+                for (Iterator<Connection> iterator = POOL.iterator(); iterator.hasNext(); ) {
+                    Connection connection = iterator.next();
+                    iterator.remove();
+                    try {
+                        connection.close();
+                    } catch (SQLException e) {
+                        e.printStackTrace();
+                    }
                 }
-              });
-    } else { // when there's no idle connection got a non-proxy connection
-      return DriverManager.getConnection(url, user, password);
+            }
+        }
+        // init driver
+        try {
+            Class.forName(driver);
+        } catch (ClassNotFoundException e) {
+            LOGGER.error(e.getMessage());
+            LOGGER.info("The error above may not cause any exception.");
+        }
+        for (int i = 0; i < poolSize; i++) {
+            Connection conn = DriverManager.getConnection(url, user, password);
+            POOL.add(conn);
+        }
+        initFlag = true;
+        version = UUID.randomUUID().toString();
     }
-  }
 
-  private void addConnection(Connection connection,String v) throws SQLException {
-    if (version.equals(v)){
-      POOL.add(connection);
-    }else {
-      connection.close();
+    public static void clear() {
+        version = UUID.randomUUID().toString();
+        synchronized (POOL) {
+            for (Iterator<Connection> iterator = POOL.iterator(); iterator.hasNext(); ) {
+                Connection connection = iterator.next();
+                iterator.remove();
+                try {
+                    connection.close();
+                } catch (SQLException e) {
+                    e.printStackTrace();
+                }
+            }
+            initFlag = false;
+        }
     }
-  }
 
+    /**
+     * get connection from pool
+     *
+     * @return a database connection
+     */
+    public Connection getConnection() throws SQLException {
+        if (!POOL.isEmpty()) {
+            String v = version;
+            final Connection connection = POOL.removeFirst();
+            return (Connection)
+                    Proxy.newProxyInstance(
+                            ExpansionAbleConnectionPool.class.getClassLoader(),
+                            connection.getClass().getInterfaces(),
+                            (proxy, method, args) -> {
+                                if (!"close".equals(method.getName())) {
+                                    return method.invoke(connection, args);
+                                } else {
+                                    addConnection(connection, v);
+                                    return null;
+                                }
+                            });
+        } else { // when there's no idle connection got a non-proxy connection
+            return DriverManager.getConnection(url, user, password);
+        }
+    }
 
-  @Override
-  public Connection getConnection(String username, String password) {
-    return null;
-  }
+    private void addConnection(Connection connection, String v) throws SQLException {
+        if (version.equals(v)) {
+            POOL.add(connection);
+        } else {
+            connection.close();
+        }
+    }
 
-  @Override
-  public <T> T unwrap(Class<T> iface) {
-    return null;
-  }
+    @Override
+    public Connection getConnection(String username, String password) {
+        throw new DataRuntimeException(
+                "Unsupported: getConnection(String username, String password), use getConnection()");
+    }
 
-  @Override
-  public boolean isWrapperFor(Class<?> iface) {
-    return false;
-  }
+    @Override
+    public <T> T unwrap(Class<T> iface) {
+        throw new DataRuntimeException("Unsupported: unwrap");
+    }
 
-  @Override
-  public PrintWriter getLogWriter() {
-    return null;
-  }
+    @Override
+    public boolean isWrapperFor(Class<?> iface) {
+        throw new DataRuntimeException("Unsupported: isWrapperFor");
+    }
 
-  @Override
-  public void setLogWriter(PrintWriter out) {}
+    @Override
+    public PrintWriter getLogWriter() {
+        return logWriter;
+    }
 
-  @Override
-  public int getLoginTimeout() {
-    return 0;
-  }
+    @Override
+    public void setLogWriter(PrintWriter out) {
+        this.logWriter = out;
+    }
 
-  @Override
-  public void setLoginTimeout(int seconds) {}
+    @Override
+    public int getLoginTimeout() {
+        return timeout;
+    }
 
-  @Override
-  public Logger getParentLogger() {
-    return null;
-  }
+    @Override
+    public void setLoginTimeout(int seconds) {
+        this.timeout = seconds;
+    }
+
+    @Override
+    public Logger getParentLogger() {
+        return null;
+    }
 }
